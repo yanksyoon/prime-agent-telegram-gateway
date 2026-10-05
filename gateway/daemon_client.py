@@ -116,3 +116,18 @@ class DaemonRPCClient:
                 pass
             self._writer = None
             self._reader = None
+
+    async def create_session(self, chat_id: str) -> str:
+        """Ask the daemon to create a session for ``chat_id``; return its id.
+
+        Sends ``{"type": "create_session", "chat_id": ...}`` and reads the
+        JSONL response, expecting ``{"session_id": ...}``.
+        """
+        await self.send({"type": "create_session", "chat_id": chat_id})
+        resp = await self.recv()
+        try:
+            return resp["session_id"]
+        except (KeyError, TypeError) as exc:  # pragma: no cover - defensive
+            raise ConnectionError(
+                f"create_session response missing 'session_id': {resp!r}"
+            ) from exc
