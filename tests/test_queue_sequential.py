@@ -61,10 +61,10 @@ def _env(monkeypatch):
     return handlers
 
 
-def _update(text: str):
+def _update(text: str, chat_id: int = CHAT_ID, user_id: int = 111):
     return SimpleNamespace(
-        effective_user=SimpleNamespace(id=111),
-        effective_chat=SimpleNamespace(id=CHAT_ID),
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=chat_id),
         message=SimpleNamespace(text=text),
     )
 
@@ -122,3 +122,39 @@ async def test_queue_full_drops_and_sends_please_wait(_env, monkeypatch):
 
     assert manager.get_queue(str(CHAT_ID)).qsize() == 1
     assert bot.sent == [(CHAT_ID, _env.QUEUE_FULL_TEXT)]
+
+
+@pytest.mark.asyncio
+async def test_different_chats_process_concurrently(_env, monkeypatch):
+    """Sanity: serialization is PER chat, not global.
+
+    Different ``chat_id`` values are independent Prime Agent sessions and must
+    proceed concurrently. Here two distinct chats each push one message at the
+    same instant; the two daemon send_message windows must overlap (i.e. the
+    per-chat workers run in parallel, not one master serial lock).
+    """
+    daemon = RecordingDaemon()
+    store = SessionManager(daemon, db_path=":memory:")
+    monkeypatch.setattr(_env, "_get_daemon", lambda: daemon)
+    monkeypatch.setattr(_env, "_get_sessions", lambda: store)
+    bot = RecordingBot()
+
+    chat_a, chat_b = 777, 888
+
+    await asyncio.gather(
+        _env.handle_message(_update("a", chat_id=chat_a), SimpleNamespace(bot=bot)),
+        _env.handle_message(_update("b", chat_id=chat_b), SimpleNamespace(bot=bot)),
+    )
+
+    manager = _env._get_queues()
+    await asyncio.wait_for(manager.get_queue(str(chat_a)).join(), timeout=2)
+    await asyncio.wait_for(manager.get_queue(str(chat_b)).join(), timeout=2)
+    manager.cancel_worker(str(chat_a))
+    manager.cancel_worker(str(chat_b))
+
+    assert len(daemon.windows) == 2, "one daemon turn per chat"
+    (s1, e1), (s2, e2) = daemon.windows
+    # Overlapping windows prove the two chats were processed concurrently.
+    assert s1 < e2 and s2 < e1, "distinct chats should overlap concurrently"
+    # Both distinct chats got their reply (order between chats is not defined).
+    assert sorted(bot.sent) == sorted([(chat_a, "World"), (chat_b, "World")])
