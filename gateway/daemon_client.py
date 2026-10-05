@@ -168,3 +168,16 @@ class DaemonRPCClient:
             raise ConnectionError(
                 f"create_session response missing 'session_id': {resp!r}"
             ) from exc
+
+    async def detach(self, session_id: str) -> dict | None:
+        """Ask the daemon to detach ``session_id``, leaving it alive in the background.
+
+        E4T3. Sends ``{"type": "detach", "session_id": ...}`` and reads the ack.
+        A daemon may drop the socket immediately on detach (no ack); that is
+        treated as success so a graceful shutdown never hangs on the response.
+        """
+        await self.send({"type": "detach", "session_id": session_id})
+        try:
+            return await self.recv()
+        except ConnectionError:  # pragma: no cover - daemon detached w/o ack
+            return None
