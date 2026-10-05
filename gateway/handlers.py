@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import tempfile
 from typing import Any
 
@@ -51,6 +52,16 @@ AGENT_BUSY_TEXT = (
 QUEUE_FULL_TEXT = (
     "Queue full, please wait."
 )
+
+# E3T3: match an absolute path with a known extension at the very END of a
+# daemon reply, e.g. ``/tmp/output.csv`` or ``/home/user/report.pdf``. The
+# ``$`` anchor is what keeps this from over-matching: a path embedded in the
+# middle of a sentence (``see /tmp/a.csv for details``) never triggers an
+# upload, because only a trailing path matches. This is the exact regex the
+# ticket specifies; combined with the ``os.path.exists`` guard in
+# ``_deliver_reply`` it cannot be tricked into uploading a file the daemon was
+# merely talking about or that is not actually readable on disk.
+FILE_PATH_RE = re.compile(r"(?P<path>/\w+[/\w\-\.]+\.(?:csv|pdf|txt|json))$")
 
 # E3T1: static, hardcoded control commands (no dynamic registration).
 # The ticket mandates three; two are named (/refine, /status) and ``clear`` is
@@ -172,8 +183,36 @@ async def _process_update(chat_id, update, context) -> str | None:
         await context.bot.send_message(chat_id=chat_id, text=AGENT_BUSY_TEXT)
         return None
 
-    await context.bot.send_message(chat_id=chat_id, text=reply)
+    await _deliver_reply(context, chat_id, reply)
     return reply
+
+
+async def _deliver_reply(context: Any, chat_id: Any, reply: str) -> None:
+    """Relay a daemon reply to Telegram, uploading a trailing file if present.
+
+    E3T3: if the reply ends in an absolute path with a known extension AND that
+    file exists on disk, we send the text (without the trailing path) as a
+    normal message and then upload the file with ``send_document``. If the
+    path does not exist we log a warning and fall back to sending the whole
+    reply as plain text, so the daemon's message is never lost and we never
+    fabricate a document for a path we cannot actually read.
+    """
+    match = FILE_PATH_RE.search(reply)  # '$' anchor: only a trailing path
+    if match:
+        path = match.group("path")
+        if os.path.exists(path):
+            text = reply[: match.start()].rstrip()
+            if text:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+            await context.bot.send_document(chat_id=chat_id, document=path)
+            return None
+        logger.warning(
+            "daemon reply references a file that does not exist on disk, "
+            "not uploading: %s",
+            path,
+        )
+    await context.bot.send_message(chat_id=chat_id, text=reply)
+    return None
 
 
 def _user_id(update):
@@ -221,7 +260,7 @@ async def _route_control(
         await context.bot.send_message(chat_id=chat_id, text=AGENT_BUSY_TEXT)
         return None
 
-    await context.bot.send_message(chat_id=chat_id, text=reply)
+    await _deliver_reply(context, chat_id, reply)
     return None
 
 
