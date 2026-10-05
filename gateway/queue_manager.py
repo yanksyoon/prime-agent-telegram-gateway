@@ -36,6 +36,12 @@ class ChatQueueManager:
         self.maxsize = maxsize
         self._queues: dict[str, asyncio.Queue] = {}
         self._workers: dict[str, asyncio.Task] = {}
+        # E4T2: last update_id processed per chat_id, for dedup. An update
+        # whose id is <= the last seen is an already-processed redelivery and
+        # is acknowledged but never forwarded. Kept small on purpose (one int
+        # per active chat); the ticket's feedback loop says cap it / LRU if it
+        # ever grows.
+        self.processed_updates: dict[int, int] = {}
 
     # -- queues ----------------------------------------------------------
     def get_queue(self, chat_id: str) -> asyncio.Queue:
@@ -58,6 +64,25 @@ class ChatQueueManager:
             return True
         except asyncio.QueueFull:
             return False
+
+    # -- update_id dedup (E4T2) ------------------------------------------
+    def is_duplicate(self, chat_id: int, update_id: int) -> bool:
+        """True if ``update_id`` is <= the last processed for ``chat_id``.
+
+        Once a chat has seen update_id N, any redelivery with id <= N is a
+        Telegram retry of already-processed work and must be dropped (the
+        handler still returns so Telegram sees it as acknowledged).
+        """
+        last = self.processed_updates.get(chat_id)
+        return last is not None and update_id <= last
+
+    def record_processed(self, chat_id: int, update_id: int) -> None:
+        """Remember that ``update_id`` for ``chat_id`` has been processed.
+
+        Called only AFTER a successful queue insertion, so a message that is
+        dropped (e.g. queue full) is not falsely marked as processed.
+        """
+        self.processed_updates[chat_id] = update_id
 
     # -- workers ---------------------------------------------------------
     def ensure_worker(self, chat_id: str, process: ProcessFn) -> asyncio.Task:

@@ -139,12 +139,32 @@ async def handle_message(update, context):
 
     chat_id = _chat_id(update)
     key = str(chat_id)
+    update_id = _update_id(update)
 
     manager = _get_queues()
+
+    # E4T2: an update_id we have already processed for this chat is a Telegram
+    # redelivery (retry loop / network glitch). Acknowledge it by simply
+    # returning -- python-telegram-bot reads a returned (unraised) handler as
+    # an ack -- but do NOT enqueue it for the daemon. The duplicate check uses
+    # the int chat_id to match ``processed_updates``' key type.
+    if update_id is not None and manager.is_duplicate(int(chat_id), update_id):
+        logger.info(
+            "duplicate update_id=%s for chat_id=%s; acked, not forwarded",
+            update_id,
+            chat_id,
+        )
+        return None
+
     if not manager.enqueue_nowait(key, (update, context)):
         logger.warning("queue full for chat_id=%s; dropping message", chat_id)
         await context.bot.send_message(chat_id=chat_id, text=QUEUE_FULL_TEXT)
         return None
+
+    # E4T2: record the id only AFTER a successful queue insertion, so a
+    # dropped message (queue full) is never falsely marked as processed.
+    if update_id is not None:
+        manager.record_processed(int(chat_id), update_id)
 
     manager.ensure_worker(key, _process_item)
     return None
@@ -221,6 +241,19 @@ def _user_id(update):
 
 def _chat_id(update):
     return getattr(getattr(update, "effective_chat", None), "id", None)
+
+
+def _update_id(update):
+    """Return the Telegram update sequence number (E4T2 dedup key).
+
+    ``update.update_id`` is a monotonically increasing int that Telegram uses
+    to mark an update as processed (you acknowledge it by replying with the
+    next id). It is the canonical way to tell a redelivery apart from a fresh
+    message. Returns ``None`` when absent so older/custom updates without one
+    always flow through (dedup is a best-effort optimization, never a loss of
+    messages).
+    """
+    return getattr(update, "update_id", None)
 
 
 def _text(update):
