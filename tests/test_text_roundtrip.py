@@ -10,6 +10,7 @@ made; the daemon is an ``AsyncMock``. This is the first test that wires the
 whole handler end to end, proving the ticket's behaviour exactly: the daemon
 receives "Hello"" and Telegram's sendMessage receives "World".
 """
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -23,6 +24,25 @@ from gateway.session_store import SessionManager
 
 ALLOWED = {111, 222}
 BOT_URL = "https://api.telegram.org/botTEST_TOKEN/sendMessage"
+
+
+async def _stop_queue(_env, chat_id: str) -> None:
+    """Drain the per-chat worker (E4T1) and stop it cleanly.
+
+    handle_message now only enqueues; the daemon call and Telegram reply happen
+    in the background per-chat worker. Tests must wait for the queue to drain
+    (and stop the worker) before asserting on its side effects.
+    """
+    manager = _env._get_queues()
+    queue = manager.get_queue(chat_id)
+    await asyncio.wait_for(queue.join(), timeout=2)
+    worker = manager._workers.pop(chat_id, None)
+    if worker is not None:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
 
 
 class FakeTelegramBot:
@@ -88,6 +108,10 @@ async def test_hello_roundtrips_to_world(_env, monkeypatch):
     captured: list[dict] = []
     with router:
         result = await _env.handle_message(_hello_update(), context)
+        # The daemon call + Telegram reply now happen in the per-chat worker
+        # (E4T1); wait for the queue to drain while still inside the respx
+        # context so the POSTs are intercepted.
+        await _stop_queue(_env, "777")
         # Capture inside the respx context: calls are reset on context exit.
         captured.append(json.loads(router.calls.last.request.content))
 
@@ -125,6 +149,7 @@ async def test_daemon_error_sends_polite_busy_reply(_env, monkeypatch):
     captured: list[dict] = []
     with router:
         result = await _env.handle_message(_hello_update(), SimpleNamespace(bot=bot))
+        await _stop_queue(_env, "777")
         captured.append(json.loads(router.calls.last.request.content))
 
     daemon.send_message.assert_awaited_once_with("sess-1", "Hello")

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 
 DEFAULT_DAEMON_SOCKET_PATH = "/tmp/pa-daemon.sock"
+DEFAULT_QUEUE_MAXSIZE = 10
 
 
 def _load_dotenv(env_file: str = ".env") -> None:
@@ -54,6 +55,7 @@ class Config:
         bot_token: str | None = None,
         daemon_socket_path: str | None = None,
         allowed_users: set[int] | None = None,
+        queue_maxsize: int | None = None,
     ) -> None:
         self.bot_token: str = (
             bot_token if bot_token is not None else os.getenv("BOT_TOKEN", "")
@@ -67,6 +69,11 @@ class Config:
             allowed_users
             if allowed_users is not None
             else _parse_allowed_users(os.getenv("ALLOWED_USERS", ""))
+        )
+        self.queue_maxsize: int = (
+            queue_maxsize
+            if queue_maxsize is not None
+            else int(os.getenv("QUEUE_MAXSIZE", str(DEFAULT_QUEUE_MAXSIZE)))
         )
 
 

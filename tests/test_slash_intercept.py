@@ -8,6 +8,7 @@ This is the ticket's acceptance test: the daemon mock's ``send_control_command``
 must be called with command ``refine`` (and ``send_message`` must NOT be called),
 and Telegram must relay the daemon's control-command reply.
 """
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -21,6 +22,24 @@ from gateway.session_store import SessionManager
 
 ALLOWED = {111, 222}
 BOT_URL = "https://api.telegram.org/botTEST_TOKEN/sendMessage"
+
+
+async def _stop_queue(_env, chat_id: str) -> None:
+    """E4T1: drain the per-chat worker before asserting on its side effects.
+
+    handle_message now only enqueues; the daemon call and Telegram reply happen
+    in the background per-chat worker.
+    """
+    manager = _env._get_queues()
+    queue = manager.get_queue(chat_id)
+    await asyncio.wait_for(queue.join(), timeout=2)
+    worker = manager._workers.pop(chat_id, None)
+    if worker is not None:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
 
 
 class FakeTelegramBot:
@@ -79,6 +98,8 @@ async def test_slash_refine_routes_to_control_payload(_env, monkeypatch):
     captured: list[dict] = []
     with router:
         result = await _env.handle_message(_slash_update("/refine"), SimpleNamespace(bot=bot))
+        # E4T1: the control-RPC + reply now run in the per-chat worker.
+        await _stop_queue(_env, "777")
         captured.append(json.loads(router.calls.last.request.content))
 
     # 1. The daemon received a structured control payload, NOT raw text.
@@ -115,6 +136,8 @@ async def test_slash_with_args_splits_command_from_payload(_env, monkeypatch):
         result = await _env.handle_message(
             _slash_update("/refine with this"), SimpleNamespace(bot=bot)
         )
+        # E4T1: control-RPC + reply run in the per-chat worker; drain it.
+        await _stop_queue(_env, "777")
 
     # The split logic must separate the command name from its payload.
     daemon.send_control_command.assert_awaited_once_with("refine", "with this")

@@ -4,6 +4,7 @@ Verify the bare-form decorator on gateway.handlers.handle_message binds the
 allowlist from ALLOWED_USERS (env) and that calling the real handler with an
 unauthorized user halts before any daemon RPC can be made.
 """
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,6 +13,20 @@ import pytest
 from gateway.session_store import SessionManager
 
 ALLOWED = {111, 222}
+
+
+async def _stop_queue(_env, chat_id: str) -> None:
+    """E4T1: drain the per-chat worker before asserting on its side effects."""
+    manager = _env._get_queues()
+    queue = manager.get_queue(chat_id)
+    await asyncio.wait_for(queue.join(), timeout=2)
+    worker = manager._workers.pop(chat_id, None)
+    if worker is not None:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
 
 
 @pytest.fixture(autouse=True)
@@ -71,6 +86,7 @@ async def test_handler_admits_authorized_user(_env, monkeypatch):
         message=SimpleNamespace(text="Hello"),
     )
     await _env.handle_message(update, SimpleNamespace(bot=bot))
+    await _stop_queue(_env, "777")  # E4T1: side effects happen in the worker
 
     assert rpc_called == ["rpc"]  # proceeded to the handler body
     daemon.send_message.assert_awaited_once_with("sess-1", "Hello")

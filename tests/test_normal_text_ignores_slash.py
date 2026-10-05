@@ -6,6 +6,7 @@ the daemon via ``send_message`` as raw text and must NOT call
 ``send_control_command``. A version of the string that merely *contains* a slash
 command elsewhere (coffee2 style) is also left alone.
 """
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -19,6 +20,20 @@ from gateway.session_store import SessionManager
 
 ALLOWED = {111, 222}
 BOT_URL = "https://api.telegram.org/botTEST_TOKEN/sendMessage"
+
+
+async def _stop_queue(_env, chat_id: str) -> None:
+    """E4T1: drain the per-chat worker before asserting on its side effects."""
+    manager = _env._get_queues()
+    queue = manager.get_queue(chat_id)
+    await asyncio.wait_for(queue.join(), timeout=2)
+    worker = manager._workers.pop(chat_id, None)
+    if worker is not None:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
 
 
 class FakeTelegramBot:
@@ -72,6 +87,8 @@ async def test_embedded_slash_is_plain_text(_env, monkeypatch):
         result = await _env.handle_message(
             _update("I like /refine"), SimpleNamespace(bot=bot)
         )
+        # E4T1: the plain-text RPC + reply run in the per-chat worker.
+        await _stop_queue(_env, "777")
         captured.append(json.loads(router.calls.last.request.content))
 
     # 1. The message went via the normal plain-text path with its full body.

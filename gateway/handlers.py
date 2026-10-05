@@ -1,32 +1,43 @@
-"""E2T1+E2T2: the main Telegram message handler.
+"""E2T1+E2T2+E4T1: the main Telegram message handler.
 
 E2T1 applies the strict inbound ``@require_acl`` gate so an unauthorized
-update is dropped BEFORE any daemon RPC can run (the RCE-critical boundary).
-E2T2 wires the actual roundtrip inside the ACL-allowed body:
+update is dropped BEFORE anything is queued (the RCE-critical boundary).
 
-  handle_message(update, context)
-    1. resolve the daemon ``session_id`` for the chat via ``SessionManager``,
-    2. send the user's text to the daemon (``daemon.send_message``),
-    3. relay the daemon's reply back to Telegram (``context.bot.send_message``).
+E4T1 makes the handler an *enqueuer*: the real work (session resolve, daemon
+RPC, Telegram reply) happens in a background per-chat worker so that
+messages for the SAME chat are processed one at a time, never concurrently.
+Prime Agent's daemon is strictly turn-based per session, so concurrent
+handling of the same chat would corrupt the session state; different chats
+are independent and each gets its own worker.
 
-The daemon and session manager are reached through module-level seams
-(``_get_daemon`` / ``_get_sessions``) so tests can inject mocks; production
-uses a real ``DaemonRPCClient`` over the configured socket backed by a
-``SessionManager``.
+The worker path is:
 
-Feedback loop: a failing daemon (busy, connection drop, bad response) must not
-crash the update. We catch it, log it, and send the user a polite
-``AGENT_BUSY_TEXT`` message instead.
+  handle_message  -> enqueue ``(update, context)`` on the chat's asyncio.Queue
+  _process_item   -> unpack the item and call ``_process_update``
+  _process_update -> 1. resolve session_id via SessionManager,
+                     2. daemon.send_message, 3. context.bot.send_message
+
+The daemon, session manager, and queue manager are reached through module-level
+seams (``_get_daemon`` / ``_get_sessions`` / ``_get_queues``) so tests can
+inject mocks; production uses a real ``DaemonRPCClient`` over the configured
+socket backed by ``SessionManager`` and ``ChatQueueManager``.
+
+Feedback loop: a failing daemon must not crash the worker or the update. We
+catch it, log it, and send the user a polite ``AGENT_BUSY_TEXT`` message.
+A chat queue that backs up (daemon wedged) drops the newest message and tells
+the user ``QUEUE_FULL_TEXT`` instead of growing without bound.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 from gateway.acl import require_acl
 from gateway.config import get_config
 from gateway.daemon_client import DaemonRPCClient
+from gateway.queue_manager import ChatQueueManager
 from gateway.session_store import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -34,14 +45,20 @@ logger = logging.getLogger(__name__)
 AGENT_BUSY_TEXT = (
     "Agent is busy or encountered an error. Please try again in a moment."
 )
+QUEUE_FULL_TEXT = (
+    "Queue full, please wait."
+)
 
 # E3T1: static, hardcoded control commands (no dynamic registration).
 # The ticket mandates three; two are named (/refine, /status) and ``clear`` is
 # the third. Unknown slash tokens (e.g. ``/nope``) fall through to plain text.
 CONTROL_COMMANDS: tuple[str, ...] = ("refine", "status", "clear")
 
+QUEUE_MAXSIZE = int(get_config().queue_maxsize)
+
 _daemon: Any | None = None
 _sessions: SessionManager | None = None
+_queues: ChatQueueManager | None = None
 
 
 def _default_daemon() -> DaemonRPCClient:
@@ -70,18 +87,56 @@ def _get_sessions() -> SessionManager:
     return _sessions
 
 
+def _get_queues() -> ChatQueueManager:
+    """Return the per-chat queue manager, building it lazily on first use.
+
+    Test seam: monkeypatch this in tests to inspect/inject queue state.
+    """
+    global _queues
+    if _queues is None:
+        _queues = ChatQueueManager(maxsize=QUEUE_MAXSIZE)
+    return _queues
+
+
 @require_acl
 async def handle_message(update, context):
-    """Handle an inbound Telegram message end to end.
+    """Queue an inbound Telegram message for sequential processing.
 
-    The ACL decorator enforces authorization before this body can run. Inside
-    we resolve the chat's daemon session, forward the text to the daemon, and
-    relay the reply back to Telegram, degrading to a polite busy message if
-    the daemon call fails rather than crashing the update.
+    The ACL decorator enforces authorization before this body can run. The
+    message (with its bot context) is appended to the chat's queue rather than
+    processed inline, so a burst of messages for one chat is serialized by the
+    per-chat worker instead of running concurrently against the same daemon
+    session. If the chat's queue is full we drop the message and tell the user
+    to wait.
     """
     logger.info("ACL allow: message from user_id=%s proceeding", _user_id(update))
 
     chat_id = _chat_id(update)
+    key = str(chat_id)
+
+    manager = _get_queues()
+    if not manager.enqueue_nowait(key, (update, context)):
+        logger.warning("queue full for chat_id=%s; dropping message", chat_id)
+        await context.bot.send_message(chat_id=chat_id, text=QUEUE_FULL_TEXT)
+        return None
+
+    manager.ensure_worker(key, _process_item)
+    return None
+
+
+async def _process_item(item: tuple[Any, Any]) -> None:
+    """Worker step: unpack a queued ``(update, context)`` and process it."""
+    update, context = item
+    await _process_update(_chat_id(update), update, context)
+
+
+async def _process_update(chat_id, update, context) -> str | None:
+    """Do the one-at-a-time work for a single message.
+
+    Returns the daemon reply, or ``None`` after sending a busy message when
+    the daemon call fails. Runs under the per-chat worker, so it is guaranteed
+    never to overlap another message for the same chat.
+    """
     text = _text(update)
 
     session_id = await _get_sessions().get_or_create_session(str(chat_id))
@@ -97,13 +152,13 @@ async def handle_message(update, context):
 
     try:
         reply = await _get_daemon().send_message(session_id, text)
-    except Exception:  # daemon busy/down/crash attacks: user sees a prompt, not a crash
+    except Exception:  # daemon busy/down: user sees a prompt, not a crash
         logger.exception("daemon send_message failed for session_id=%s", session_id)
         await context.bot.send_message(chat_id=chat_id, text=AGENT_BUSY_TEXT)
         return None
 
     await context.bot.send_message(chat_id=chat_id, text=reply)
-    return None
+    return reply
 
 
 def _user_id(update):
