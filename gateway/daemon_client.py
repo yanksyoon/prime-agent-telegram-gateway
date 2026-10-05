@@ -135,6 +135,25 @@ class DaemonRPCClient:
                 f"send_message response missing 'text': {resp!r}"
             ) from exc
 
+    async def send_control_command(self, command: str, args: str = "") -> str:
+        """Send a control command (e.g. ``refine``, ``status``) to the daemon.
+
+        E3T1. Sends ``{"type": "control", "command": ...}`` (with ``args`` added
+        only when non-empty) and reads back the daemon's ``{"text": ...}``
+        reply, returning the plain string.
+        """
+        payload: dict = {"type": "control", "command": command}
+        if args:
+            payload["args"] = args
+        await self.send(payload)
+        resp = await self.recv()
+        try:
+            return resp["text"]
+        except (KeyError, TypeError) as exc:  # pragma: no cover - defensive
+            raise ConnectionError(
+                f"send_control_command response missing 'text': {resp!r}"
+            ) from exc
+
     async def create_session(self, chat_id: str) -> str:
         """Ask the daemon to create a session for ``chat_id``; return its id.
 
