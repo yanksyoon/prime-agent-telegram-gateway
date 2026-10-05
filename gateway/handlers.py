@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import tempfile
 from typing import Any
 
 from gateway.acl import require_acl
@@ -39,6 +41,7 @@ from gateway.config import get_config
 from gateway.daemon_client import DaemonRPCClient
 from gateway.queue_manager import ChatQueueManager
 from gateway.session_store import SessionManager
+from gateway.stt import SttEngine, mock_stt_engine
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,7 @@ QUEUE_MAXSIZE = int(get_config().queue_maxsize)
 _daemon: Any | None = None
 _sessions: SessionManager | None = None
 _queues: ChatQueueManager | None = None
+_stt: SttEngine | None = None
 
 
 def _default_daemon() -> DaemonRPCClient:
@@ -96,6 +100,17 @@ def _get_queues() -> ChatQueueManager:
     if _queues is None:
         _queues = ChatQueueManager(maxsize=QUEUE_MAXSIZE)
     return _queues
+
+
+def _get_stt() -> SttEngine:
+    """Return the speech-to-text engine (defaults to the mock engine).
+
+    Test seam: monkeypatch this in tests to inject a mocked transcription.
+    """
+    global _stt
+    if _stt is None:
+        _stt = mock_stt_engine
+    return _stt
 
 
 @require_acl
@@ -208,3 +223,47 @@ async def _route_control(
 
     await context.bot.send_message(chat_id=chat_id, text=reply)
     return None
+
+
+@require_acl
+async def handle_voice(update, context):
+    """Handle an inbound Telegram voice note (mocked STT).
+
+    ACL-gated like ``handle_message``. Downloads the voice file to a temp path,
+    runs it through the (mock) STT engine, then reuses ``handle_message`` with
+    the transcribed text as ``update.message.text`` so the transcribed text
+    flows through the exact same queue / daemon / reply path as a normal
+    message.
+
+    Scope: mocked STT only. Real STT (faster-whisper) is a separate later task.
+    Feedback loop: the temp file is always removed (``finally``) so voice
+    notes cannot leak files onto disk; a download/transcription failure sends
+    the user a polite busy message rather than crashing.
+    """
+    logger.info("ACL allow: voice from user_id=%s transcribing", _user_id(update))
+
+    chat_id = _chat_id(update)
+    file_path: str | None = None
+    try:
+        voice = update.message.voice
+        file = await voice.get_file()
+
+        # Download to a unique temp path (suffix .ogg is the Telegram audio
+        # container; a future real STT engine reads it from here).
+        fd, file_path = tempfile.mkstemp(prefix="voice_", suffix=".ogg")
+        os.close(fd)
+        await file.download_to_drive(custom_path=file_path)
+
+        transcribed = await _get_stt().transcribe(file_path)
+        update.message.text = transcribed  # reuse the text-message path
+        return await handle_message(update, context)
+    except Exception:  # download/STT failure: user sees a prompt, not a crash
+        logger.exception("voice transcription failed for chat_id=%s", chat_id)
+        await context.bot.send_message(chat_id=chat_id, text=AGENT_BUSY_TEXT)
+        return None
+    finally:
+        if file_path is not None:
+            try:
+                os.remove(file_path)  # prevent temp-file disk leaks
+            except OSError:  # pragma: no cover - already cleaned / never created
+                pass
