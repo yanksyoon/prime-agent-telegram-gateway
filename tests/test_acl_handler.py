@@ -5,8 +5,11 @@ allowlist from ALLOWED_USERS (env) and that calling the real handler with an
 unauthorized user halts before any daemon RPC can be made.
 """
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+
+from gateway.session_store import SessionManager
 
 ALLOWED = {111, 222}
 
@@ -50,6 +53,25 @@ async def test_handler_admits_authorized_user(_env, monkeypatch):
         "gateway.handlers.logger.info", lambda *a, **k: rpc_called.append("rpc")
     )
 
-    await _env.handle_message(_update_with(111), SimpleNamespace())
+    # E2T2: the ACL-allowed body now does session RPC + Telegram reply, so the
+    # admit test must inject daemon/session/bot seams for the body to run.
+    daemon = SimpleNamespace(
+        create_session=AsyncMock(return_value="sess-1"),
+        send_message=AsyncMock(return_value="World"),
+    )
+    monkeypatch.setattr(_env, "_get_daemon", lambda: daemon)
+    monkeypatch.setattr(
+        _env, "_get_sessions", lambda: SessionManager(daemon, db_path=":memory:")
+    )
+    bot = SimpleNamespace(send_message=AsyncMock())
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=111),
+        effective_chat=SimpleNamespace(id=777),
+        message=SimpleNamespace(text="Hello"),
+    )
+    await _env.handle_message(update, SimpleNamespace(bot=bot))
 
     assert rpc_called == ["rpc"]  # proceeded to the handler body
+    daemon.send_message.assert_awaited_once_with("sess-1", "Hello")
+    bot.send_message.assert_awaited_once()

@@ -117,6 +117,24 @@ class DaemonRPCClient:
             self._writer = None
             self._reader = None
 
+    async def send_message(self, session_id: str, text: str) -> str:
+        """Send user ``text`` to the daemon for ``session_id``; return the reply.
+
+        E2T2. Sends ``{"type": "message", "session_id": ..., "text": ...}`` and
+        reads the JSONL response, expecting ``{"text": ...}`` (the daemon's
+        plain reply string).
+        """
+        await self.send(
+            {"type": "message", "session_id": session_id, "text": text}
+        )
+        resp = await self.recv()
+        try:
+            return resp["text"]
+        except (KeyError, TypeError) as exc:  # pragma: no cover - defensive
+            raise ConnectionError(
+                f"send_message response missing 'text': {resp!r}"
+            ) from exc
+
     async def create_session(self, chat_id: str) -> str:
         """Ask the daemon to create a session for ``chat_id``; return its id.
 
