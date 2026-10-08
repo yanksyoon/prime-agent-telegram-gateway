@@ -86,7 +86,7 @@ async def test_handler_admits_authorized_user(_env, monkeypatch):
         message=SimpleNamespace(text="Hello"),
     )
     await _env.handle_message(update, SimpleNamespace(bot=bot))
-    await _stop_queue(_env, "777")  # E4T1: side effects happen in the worker
+    await _stop_queue(_env, "777:0")  # E4T1: side effects happen in the worker
 
     assert rpc_called == ["rpc"]  # proceeded to the handler body
     daemon.send_message.assert_awaited_once_with("sess-1", "Hello")

@@ -138,7 +138,10 @@ async def handle_message(update, context):
     logger.info("ACL allow: message from user_id=%s proceeding", _user_id(update))
 
     chat_id = _chat_id(update)
-    key = str(chat_id)
+    # E-per-topic: the conversation key is (chat_id, message_thread_id), so a
+    # forum supergroup holds one lane (queue + session) per TOPIC, not per chat.
+    key = _chat_key(update)
+    thread_id = _thread_id(update)
     update_id = _update_id(update)
 
     manager = _get_queues()
@@ -147,7 +150,8 @@ async def handle_message(update, context):
     # redelivery (retry loop / network glitch). Acknowledge it by simply
     # returning -- python-telegram-bot reads a returned (unraised) handler as
     # an ack -- but do NOT enqueue it for the daemon. The duplicate check uses
-    # the int chat_id to match ``processed_updates``' key type.
+    # the int chat_id (NOT the topic) because Telegram's update_id is global
+    # per group across topics.
     if update_id is not None and manager.is_duplicate(int(chat_id), update_id):
         logger.info(
             "duplicate update_id=%s for chat_id=%s; acked, not forwarded",
@@ -157,8 +161,10 @@ async def handle_message(update, context):
         return None
 
     if not manager.enqueue_nowait(key, (update, context)):
-        logger.warning("queue full for chat_id=%s; dropping message", chat_id)
-        await context.bot.send_message(chat_id=chat_id, text=QUEUE_FULL_TEXT)
+        logger.warning("queue full for key=%s; dropping message", key)
+        await context.bot.send_message(
+            chat_id=chat_id, text=QUEUE_FULL_TEXT, **_thread_kwargs(thread_id)
+        )
         return None
 
     # E4T2: record the id only AFTER a successful queue insertion, so a
@@ -173,19 +179,22 @@ async def handle_message(update, context):
 async def _process_item(item: tuple[Any, Any]) -> None:
     """Worker step: unpack a queued ``(update, context)`` and process it."""
     update, context = item
-    await _process_update(_chat_id(update), update, context)
+    await _process_update(_chat_id(update), _thread_id(update), update, context)
 
 
-async def _process_update(chat_id, update, context) -> str | None:
+async def _process_update(chat_id, thread_id, update, context) -> str | None:
     """Do the one-at-a-time work for a single message.
 
     Returns the daemon reply, or ``None`` after sending a busy message when
-    the daemon call fails. Runs under the per-chat worker, so it is guaranteed
-    never to overlap another message for the same chat.
+    the daemon call fails. Runs under the per-topic worker, so it is guaranteed
+    never to overlap another message for the same conversation key.
     """
     text = _text(update)
 
-    session_id = await _get_sessions().get_or_create_session(str(chat_id))
+    # Session is resolved per conversation key ("{chat_id}:{thread_id}"), so
+    # each topic owns a distinct daemon session; thread_id drives the reply
+    # back into the originating topic below.
+    session_id = await _get_sessions().get_or_create_session(_chat_key(update))
 
     # E3T1: a leading '/' marks a control command. Intercept known ones and
     # route them as a structured control payload instead of raw text. Anything
@@ -194,20 +203,24 @@ async def _process_update(chat_id, update, context) -> str | None:
     if text and text.startswith("/"):
         command, args = _parse_slash_command(text)
         if command in CONTROL_COMMANDS:
-            return await _route_control(command, args, session_id, chat_id, context)
+            return await _route_control(
+                command, args, session_id, chat_id, thread_id, context
+            )
 
     try:
         reply = await _get_daemon().send_message(session_id, text)
     except Exception:  # daemon busy/down: user sees a prompt, not a crash
         logger.exception("daemon send_message failed for session_id=%s", session_id)
-        await context.bot.send_message(chat_id=chat_id, text=AGENT_BUSY_TEXT)
+        await context.bot.send_message(
+            chat_id=chat_id, text=AGENT_BUSY_TEXT, **_thread_kwargs(thread_id)
+        )
         return None
 
-    await _deliver_reply(context, chat_id, reply)
+    await _deliver_reply(context, chat_id, thread_id, reply)
     return reply
 
 
-async def _deliver_reply(context: Any, chat_id: Any, reply: str) -> None:
+async def _deliver_reply(context: Any, chat_id: Any, thread_id: Any, reply: str) -> None:
     """Relay a daemon reply to Telegram, uploading a trailing file if present.
 
     E3T3: if the reply ends in an absolute path with a known extension AND that
@@ -216,6 +229,10 @@ async def _deliver_reply(context: Any, chat_id: Any, reply: str) -> None:
     path does not exist we log a warning and fall back to sending the whole
     reply as plain text, so the daemon's message is never lost and we never
     fabricate a document for a path we cannot actually read.
+
+    Every outbound send carries ``message_thread_id`` when the message came
+    from a forum topic (``_thread_kwargs`` returns ``{}`` for non-forum), so
+    the answer lands back in the originating topic.
     """
     match = FILE_PATH_RE.search(reply)  # '$' anchor: only a trailing path
     if match:
@@ -223,15 +240,25 @@ async def _deliver_reply(context: Any, chat_id: Any, reply: str) -> None:
         if os.path.exists(path):
             text = reply[: match.start()].rstrip()
             if text:
-                await context.bot.send_message(chat_id=chat_id, text=text)
-            await context.bot.send_document(chat_id=chat_id, document=path)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    **_thread_kwargs(thread_id),
+                )
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=path,
+                **_thread_kwargs(thread_id),
+            )
             return None
         logger.warning(
             "daemon reply references a file that does not exist on disk, "
             "not uploading: %s",
             path,
         )
-    await context.bot.send_message(chat_id=chat_id, text=reply)
+    await context.bot.send_message(
+        chat_id=chat_id, text=reply, **_thread_kwargs(thread_id)
+    )
     return None
 
 
@@ -241,6 +268,51 @@ def _user_id(update):
 
 def _chat_id(update):
     return getattr(getattr(update, "effective_chat", None), "id", None)
+
+
+def _message_thread_id(update):
+    """Return the forum ``message_thread_id``, or ``None`` for non-forum chats."""
+    return getattr(getattr(update, "message", None), "message_thread_id", None)
+
+
+def _thread_id(update):
+    """Normalised topic id: ``message_thread_id`` or ``0`` for non-forum chats.
+
+    ``None`` (a DM or a non-forum group) becomes ``0`` so the conversation key
+    and the outbound ``message_thread_id`` handling have a single, simple shape.
+    """
+    tid = _message_thread_id(update)
+    return tid if tid is not None else 0
+
+
+def _chat_key(update) -> str:
+    """Per-topic conversation key: ``f"{chat_id}:{message_thread_id or 0}"``.
+
+    This is the queue/session identity. In a forum supergroup each topic
+    (message_thread_id) gets its own lane; a non-forum chat always uses
+    thread ``0``, i.e. ``f"{chat_id}:0"``, preserving the old per-chat
+    behaviour exactly.
+
+    Future: a per-USER-isolation variant is a one line change here — swap
+    ``_chat_id(update)`` for ``_user_id(update)`` in the key template (and
+    thread the reply by the resolved user/chat accordingly) — so a topic can
+    hold one session per person instead of one shared by everyone who messages
+    in it. Deliberately NOT built now (scope decision: the topic is the
+    session identity).
+    """
+    return f"{_chat_id(update)}:{_thread_id(update)}"
+
+
+def _thread_kwargs(thread_id: Any) -> dict:
+    """``message_thread_id`` kwarg for outbound sends; ``{}`` for non-forum.
+
+    python-telegram-bot's reply methods accept ``message_thread_id``. We only
+    attach it when the message actually came from a topic (``thread_id``
+    truthy); for a non-forum chat it stays absent so normal DMs are unchanged.
+    """
+    if thread_id:
+        return {"message_thread_id": thread_id}
+    return {}
 
 
 def _update_id(update):
@@ -276,12 +348,18 @@ def _parse_slash_command(text: str) -> tuple[str, str]:
 
 
 async def _route_control(
-    command: str, args: str, session_id: str, chat_id: Any, context: Any
+    command: str,
+    args: str,
+    session_id: str,
+    chat_id: Any,
+    thread_id: Any,
+    context: Any,
 ) -> None:
     """Send a recognized control command to the daemon and relay the reply.
 
     Mirrors the plain-text path's failure handling: a failing daemon yields a
-    polite busy message, never a crash.
+    polite busy message, never a crash, and every outbound send carries the
+    topic's ``message_thread_id``.
     """
     logger.info("control command /%s from session_id=%s", command, session_id)
     try:
@@ -290,10 +368,12 @@ async def _route_control(
         logger.exception(
             "daemon send_control_command failed for session_id=%s", session_id
         )
-        await context.bot.send_message(chat_id=chat_id, text=AGENT_BUSY_TEXT)
+        await context.bot.send_message(
+            chat_id=chat_id, text=AGENT_BUSY_TEXT, **_thread_kwargs(thread_id)
+        )
         return None
 
-    await _deliver_reply(context, chat_id, reply)
+    await _deliver_reply(context, chat_id, thread_id, reply)
     return None
 
 
@@ -331,7 +411,11 @@ async def handle_voice(update, context):
         return await handle_message(update, context)
     except Exception:  # download/STT failure: user sees a prompt, not a crash
         logger.exception("voice transcription failed for chat_id=%s", chat_id)
-        await context.bot.send_message(chat_id=chat_id, text=AGENT_BUSY_TEXT)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=AGENT_BUSY_TEXT,
+            **_thread_kwargs(_thread_id(update)),
+        )
         return None
     finally:
         if file_path is not None:

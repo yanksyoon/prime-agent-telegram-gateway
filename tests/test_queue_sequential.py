@@ -85,10 +85,10 @@ async def test_same_chat_messages_process_sequentially(_env, monkeypatch):
     )
 
     manager = _env._get_queues()
-    queue = manager.get_queue(str(CHAT_ID))
+    queue = manager.get_queue(f"{CHAT_ID}:0")
     # All three queued items must drain through the per-chat worker.
     await asyncio.wait_for(queue.join(), timeout=2)
-    manager.cancel_worker(str(CHAT_ID))
+    manager.cancel_worker(f"{CHAT_ID}:0")
 
     # The daemon was asked 3 times, once per message, with no overlap.
     assert len(daemon.windows) == 3, "send_message must be called 3 times"
@@ -120,7 +120,7 @@ async def test_queue_full_drops_and_sends_please_wait(_env, monkeypatch):
     # Queue is full now; a second message is dropped, not processed.
     await _env.handle_message(_update("second"), SimpleNamespace(bot=bot))
 
-    assert manager.get_queue(str(CHAT_ID)).qsize() == 1
+    assert manager.get_queue(f"{CHAT_ID}:0").qsize() == 1
     assert bot.sent == [(CHAT_ID, _env.QUEUE_FULL_TEXT)]
 
 
@@ -147,10 +147,10 @@ async def test_different_chats_process_concurrently(_env, monkeypatch):
     )
 
     manager = _env._get_queues()
-    await asyncio.wait_for(manager.get_queue(str(chat_a)).join(), timeout=2)
-    await asyncio.wait_for(manager.get_queue(str(chat_b)).join(), timeout=2)
-    manager.cancel_worker(str(chat_a))
-    manager.cancel_worker(str(chat_b))
+    await asyncio.wait_for(manager.get_queue(f"{chat_a}:0").join(), timeout=2)
+    await asyncio.wait_for(manager.get_queue(f"{chat_b}:0").join(), timeout=2)
+    manager.cancel_worker(f"{chat_a}:0")
+    manager.cancel_worker(f"{chat_b}:0")
 
     assert len(daemon.windows) == 2, "one daemon turn per chat"
     (s1, e1), (s2, e2) = daemon.windows

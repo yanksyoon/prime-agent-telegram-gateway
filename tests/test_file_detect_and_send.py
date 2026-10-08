@@ -121,7 +121,7 @@ async def test_file_detect_and_send(_env, monkeypatch, tmp_path):
 
     with _mock_telegram():
         await _env.handle_message(_update(), SimpleNamespace(bot=bot))
-        await _stop_queue(_env, "777")
+        await _stop_queue(_env, "777:0")
 
     # The text is the reply with the trailing path stripped.
     expected_text = reply[: -len(str(target))].rstrip()
@@ -139,7 +139,7 @@ async def test_reply_not_ending_in_path_sends_text_only(_env, monkeypatch):
 
     with _mock_telegram():
         await _env.handle_message(_update(), SimpleNamespace(bot=bot))
-        await _stop_queue(_env, "777")
+        await _stop_queue(_env, "777:0")
 
     assert bot.sent_messages == [(777, "All done, nothing to upload.")]
     assert bot.sent_documents == []

@@ -131,7 +131,7 @@ async def test_voice_mock_transcribes_and_reaches_daemon(_env, monkeypatch):
     router = _router()
     with router:
         result = await _env.handle_voice(update, SimpleNamespace(bot=bot))
-        await _stop_queue(_env, str(CHAT_ID))  # drain the background worker
+        await _stop_queue(_env, f"{CHAT_ID}:0")  # drain the background worker
         captured.append(json.loads(router.calls.last.request.content))
 
     # 1. The voice file was downloaded and handed to the STT engine.

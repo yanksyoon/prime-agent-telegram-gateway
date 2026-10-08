@@ -88,7 +88,7 @@ async def test_embedded_slash_is_plain_text(_env, monkeypatch):
             _update("I like /refine"), SimpleNamespace(bot=bot)
         )
         # E4T1: the plain-text RPC + reply run in the per-chat worker.
-        await _stop_queue(_env, "777")
+        await _stop_queue(_env, "777:0")
         captured.append(json.loads(router.calls.last.request.content))
 
     # 1. The message went via the normal plain-text path with its full body.

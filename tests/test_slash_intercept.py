@@ -99,7 +99,7 @@ async def test_slash_refine_routes_to_control_payload(_env, monkeypatch):
     with router:
         result = await _env.handle_message(_slash_update("/refine"), SimpleNamespace(bot=bot))
         # E4T1: the control-RPC + reply now run in the per-chat worker.
-        await _stop_queue(_env, "777")
+        await _stop_queue(_env, "777:0")
         captured.append(json.loads(router.calls.last.request.content))
 
     # 1. The daemon received a structured control payload, NOT raw text.
@@ -137,7 +137,7 @@ async def test_slash_with_args_splits_command_from_payload(_env, monkeypatch):
             _slash_update("/refine with this"), SimpleNamespace(bot=bot)
         )
         # E4T1: control-RPC + reply run in the per-chat worker; drain it.
-        await _stop_queue(_env, "777")
+        await _stop_queue(_env, "777:0")
 
     # The split logic must separate the command name from its payload.
     daemon.send_control_command.assert_awaited_once_with("refine", "with this")

@@ -78,13 +78,13 @@ async def test_duplicate_update_id_not_forwarded(_env, monkeypatch):
 
     # First delivery of update_id=100: processed normally.
     await _env.handle_message(_update(update_id=100), SimpleNamespace(bot=bot))
-    await asyncio.wait_for(manager.get_queue(str(CHAT_ID)).join(), timeout=2)
+    await asyncio.wait_for(manager.get_queue(f"{CHAT_ID}:0").join(), timeout=2)
 
     # Resend the SAME update_id=100: acknowledged, but NOT forwarded.
     await _env.handle_message(_update(update_id=100), SimpleNamespace(bot=bot))
-    await asyncio.wait_for(manager.get_queue(str(CHAT_ID)).join(), timeout=2)
+    await asyncio.wait_for(manager.get_queue(f"{CHAT_ID}:0").join(), timeout=2)
 
-    manager.cancel_worker(str(CHAT_ID))
+    manager.cancel_worker(f"{CHAT_ID}:0")
 
     assert daemon.calls == ["hello"], "daemon must be called exactly once"
     assert bot.sent == [(CHAT_ID, "World")], "only one reply should be sent"
@@ -102,13 +102,13 @@ async def test_newer_update_id_still_processed(_env, monkeypatch):
     manager = _env._get_queues()
 
     await _env.handle_message(_update(update_id=100, text="one"), SimpleNamespace(bot=bot))
-    await asyncio.wait_for(manager.get_queue(str(CHAT_ID)).join(), timeout=2)
+    await asyncio.wait_for(manager.get_queue(f"{CHAT_ID}:0").join(), timeout=2)
 
     # A strictly newer id for the same chat must NOT be deduped.
     await _env.handle_message(_update(update_id=101, text="two"), SimpleNamespace(bot=bot))
-    await asyncio.wait_for(manager.get_queue(str(CHAT_ID)).join(), timeout=2)
+    await asyncio.wait_for(manager.get_queue(f"{CHAT_ID}:0").join(), timeout=2)
 
-    manager.cancel_worker(str(CHAT_ID))
+    manager.cancel_worker(f"{CHAT_ID}:0")
 
     assert daemon.calls == ["one", "two"], "both distinct ids must reach the daemon"
     assert bot.sent == [(CHAT_ID, "World"), (CHAT_ID, "World")]

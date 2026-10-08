@@ -111,7 +111,7 @@ async def test_hello_roundtrips_to_world(_env, monkeypatch):
         # The daemon call + Telegram reply now happen in the per-chat worker
         # (E4T1); wait for the queue to drain while still inside the respx
         # context so the POSTs are intercepted.
-        await _stop_queue(_env, "777")
+        await _stop_queue(_env, "777:0")
         # Capture inside the respx context: calls are reset on context exit.
         captured.append(json.loads(router.calls.last.request.content))
 
@@ -149,7 +149,7 @@ async def test_daemon_error_sends_polite_busy_reply(_env, monkeypatch):
     captured: list[dict] = []
     with router:
         result = await _env.handle_message(_hello_update(), SimpleNamespace(bot=bot))
-        await _stop_queue(_env, "777")
+        await _stop_queue(_env, "777:0")
         captured.append(json.loads(router.calls.last.request.content))
 
     daemon.send_message.assert_awaited_once_with("sess-1", "Hello")

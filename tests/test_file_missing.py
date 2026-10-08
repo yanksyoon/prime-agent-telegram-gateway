@@ -114,7 +114,7 @@ async def test_missing_file_not_uploaded_and_warns(_env, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="gateway.handlers"):
         with _mock_telegram():
             await _env.handle_message(_update(), SimpleNamespace(bot=bot))
-            await _stop_queue(_env, "777")
+            await _stop_queue(_env, "777:0")
 
     # send_document is NEVER called when the path is missing.
     assert bot.sent_documents == []
